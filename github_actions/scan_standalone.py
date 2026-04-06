@@ -3,6 +3,11 @@
 scan_standalone.py — סריקת פוסטים על משכנתא
 גרסה עצמאית לריצה ב-GitHub Actions (ללא CDP, עם headless Chromium)
 cookies נטענות מ-environment variables
+
+שינויים:
+- הוסרה תלות ב-OpenAI (ללא סיכום AI)
+- מניעת כפילויות: seen_posts.json נשמר בין ריצות דרך GitHub Actions cache
+- התראה על cookies פגים: שליחת הודעת WhatsApp אם הדפדפן מנותב ל-login
 """
 
 import asyncio
@@ -13,18 +18,16 @@ import string
 import requests
 from datetime import datetime
 from pathlib import Path
-from openai import OpenAI
 from playwright.async_api import async_playwright
 
 # ===== הגדרות מ-Environment Variables =====
 GREEN_API_INSTANCE = os.environ.get("GREEN_API_INSTANCE", "7103518794")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
 WHATSAPP_PHONE = os.environ.get("WHATSAPP_PHONE", "972543339066")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 FB_COOKIES_JSON = os.environ.get("FB_COOKIES_JSON", "[]")
 IG_COOKIES_JSON = os.environ.get("IG_COOKIES_JSON", "[]")
 
-# קבצי state — ב-GitHub Actions נשמרים ב-/tmp
+# קבצי state — ב-GitHub Actions נשמרים ב-/tmp (מועברים בין ריצות דרך cache)
 BASE_DIR = Path(os.environ.get("DATA_DIR", "/tmp/mortgage_data"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 SEEN_POSTS_FILE = BASE_DIR / "seen_posts.json"
@@ -108,16 +111,22 @@ def generate_short_id(post_id_str):
 
 
 def load_seen_posts():
+    """טוען את רשימת הפוסטים שכבר נשלחו — מניעת כפילויות בין ריצות"""
     if SEEN_POSTS_FILE.exists():
         with open(SEEN_POSTS_FILE) as f:
             data = json.load(f)
-            return set(data) if isinstance(data, list) else set()
+            seen = set(data) if isinstance(data, list) else set()
+            print(f"📋 נטענו {len(seen)} פוסטים ידועים (מניעת כפילויות)")
+            return seen
+    print("📋 אין היסטוריית פוסטים — ריצה ראשונה")
     return set()
 
 
 def save_seen_posts(seen):
+    """שומר את רשימת הפוסטים שנשלחו — יועבר לריצה הבאה דרך cache"""
     with open(SEEN_POSTS_FILE, 'w') as f:
         json.dump(list(seen), f, ensure_ascii=False)
+    print(f"💾 נשמרו {len(seen)} פוסטים ידועים")
 
 
 def load_pending():
@@ -132,7 +141,7 @@ def save_pending(pending):
         json.dump(pending, f, ensure_ascii=False, indent=2)
 
 
-def add_to_pending(post_id, short_id, post_text, post_url, source, summary):
+def add_to_pending(post_id, short_id, post_text, post_url, source):
     pending = load_pending()
     pending[post_id] = {
         'post_id': post_id,
@@ -140,7 +149,6 @@ def add_to_pending(post_id, short_id, post_text, post_url, source, summary):
         'post_text': post_text[:2000],
         'post_url': post_url,
         'source': source,
-        'summary': summary,
         'timestamp': datetime.now().isoformat(),
         'status': 'waiting'
     }
@@ -158,23 +166,6 @@ def is_commercial_post(text):
 def is_mortgage_related(text):
     text_lower = text.lower()
     return any(kw.lower() in text_lower for kw in MORTGAGE_KEYWORDS)
-
-
-def summarize_post(text):
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": "אתה עוזר שמסכם פוסטים על משכנתאות בעברית. סכם בקצרה (2-3 משפטים) את עיקר הפוסט."},
-                {"role": "user", "content": f"סכם את הפוסט הבא:\n\n{text[:2000]}"}
-            ],
-            max_tokens=200
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"  שגיאה בסיכום: {e}")
-        return text[:200] + "..."
 
 
 def send_whatsapp(message):
@@ -200,9 +191,19 @@ async def scrape_facebook_group(page, group_url, seen_posts):
         print(f"  📘 סורק: {group_name}")
         await page.goto(group_url, wait_until='domcontentloaded', timeout=30000)
         await asyncio.sleep(4)
-        if 'login' in page.url:
-            print(f"    ⚠️ לא מחובר — צריך לרענן cookies")
-            return new_posts
+
+        # בדיקת cookies פגים — אם מנותב ל-login
+        current_url = page.url
+        if 'login' in current_url or 'checkpoint' in current_url:
+            print(f"    ⚠️ cookies פייסבוק פגו — נשלחת התראה לוואטסאפ")
+            send_whatsapp(
+                "⚠️ *התראת מערכת — Mortgage Monitor*\n\n"
+                "ה-cookies של פייסבוק פגו ואינם תקפים יותר.\n"
+                "הסריקה לא יכולה להתחבר לקבוצות.\n\n"
+                "נדרש חידוש cookies — אנא פנה ל-Manus לביצוע החידוש."
+            )
+            return new_posts, True  # True = cookies פגו
+
         await page.evaluate("window.scrollBy(0, 500)")
         await asyncio.sleep(2)
         posts_data = await page.evaluate(FB_EXTRACT_JS)
@@ -226,19 +227,30 @@ async def scrape_facebook_group(page, group_url, seen_posts):
         print(f"    {len(new_posts)} פוסטים רלוונטיים חדשים")
     except Exception as e:
         print(f"    ❌ שגיאה: {e}")
-    return new_posts
+    return new_posts, False  # False = cookies תקינים
 
 
 async def scrape_instagram(page, hashtag, seen_posts):
     new_posts = []
+    cookies_expired = False
     try:
         print(f"  📸 סורק אינסטגרם: #{hashtag}")
         url = f"https://www.instagram.com/explore/tags/{hashtag}/"
         await page.goto(url, wait_until='domcontentloaded', timeout=30000)
         await asyncio.sleep(4)
-        if 'login' in page.url or 'accounts' in page.url:
-            print(f"    ⚠️ לא מחובר לאינסטגרם — צריך לרענן cookies")
-            return new_posts
+
+        # בדיקת cookies פגים
+        current_url = page.url
+        if 'login' in current_url or 'accounts' in current_url:
+            print(f"    ⚠️ cookies אינסטגרם פגו — נשלחת התראה לוואטסאפ")
+            send_whatsapp(
+                "⚠️ *התראת מערכת — Mortgage Monitor*\n\n"
+                "ה-cookies של אינסטגרם פגו ואינם תקפים יותר.\n"
+                "הסריקה לא יכולה להתחבר לאינסטגרם.\n\n"
+                "נדרש חידוש cookies — אנא פנה ל-Manus לביצוע החידוש."
+            )
+            return new_posts, True  # True = cookies פגו
+
         post_links = await page.evaluate(IG_EXTRACT_JS)
         print(f"    נמצאו {len(post_links)} פוסטים")
         for link_data in post_links[:8]:
@@ -275,7 +287,7 @@ async def scrape_instagram(page, hashtag, seen_posts):
         print(f"    {len(new_posts)} פוסטים רלוונטיים חדשים")
     except Exception as e:
         print(f"    ❌ שגיאה: {e}")
-    return new_posts
+    return new_posts, cookies_expired
 
 
 async def run_scan():
@@ -293,8 +305,11 @@ async def run_scan():
         fb_cookies = []
         ig_cookies = []
 
+    # טעינת היסטוריית פוסטים (מניעת כפילויות)
     seen_posts = load_seen_posts()
     all_new_posts = []
+    fb_cookies_expired = False
+    ig_cookies_expired = False
 
     async with async_playwright() as p:
         # הפעלת Chromium headless
@@ -321,7 +336,10 @@ async def run_scan():
         # סריקת קבוצות פייסבוק
         print("\n📘 סורק קבוצות פייסבוק...")
         for group_url in FACEBOOK_GROUPS:
-            posts = await scrape_facebook_group(fb_page, group_url, seen_posts)
+            posts, expired = await scrape_facebook_group(fb_page, group_url, seen_posts)
+            if expired:
+                fb_cookies_expired = True
+                break  # אין טעם להמשיך אם cookies פגו
             all_new_posts.extend(posts)
             for p_item in posts:
                 seen_posts.add(p_item['id'])
@@ -339,32 +357,63 @@ async def run_scan():
 
         # סריקת אינסטגרם
         print("\n📸 סורק אינסטגרם...")
-        ig_posts = await scrape_instagram(ig_page, INSTAGRAM_HASHTAG, seen_posts)
-        all_new_posts.extend(ig_posts)
-        for p_item in ig_posts:
-            seen_posts.add(p_item['id'])
+        ig_posts, ig_expired = await scrape_instagram(ig_page, INSTAGRAM_HASHTAG, seen_posts)
+        if ig_expired:
+            ig_cookies_expired = True
+        else:
+            all_new_posts.extend(ig_posts)
+            for p_item in ig_posts:
+                seen_posts.add(p_item['id'])
 
         await ig_context.close()
         await browser.close()
 
     print(f"\n📊 סה\"כ {len(all_new_posts)} פוסטים חדשים")
+
+    # שמירת היסטוריית פוסטים (גם אם אין פוסטים חדשים — לשמור את הנוכחיים)
     save_seen_posts(seen_posts)
 
     if not all_new_posts:
-        print("אין פוסטים חדשים")
+        if not fb_cookies_expired and not ig_cookies_expired:
+            print("אין פוסטים חדשים")
         return
 
-    # סיכום ושליחה לוואטסאפ
-    msg_lines = [f"🔍 סריקה {datetime.now().strftime('%d/%m %H:%M')} — {len(all_new_posts)} פוסטים חדשים:\n"]
+    # בניית הודעת WhatsApp ללא סיכום AI — הטקסט הגולמי + קישור
+    now_str = datetime.now().strftime('%d/%m %H:%M')
+    msg_lines = [f"🔍 סריקה {now_str} — {len(all_new_posts)} פוסטים חדשים:\n"]
+
     for post in all_new_posts:
         short_id = generate_short_id(post['id'])
-        summary = summarize_post(post['text'])
-        add_to_pending(post['id'], short_id, post['text'], post['url'], post['source'], summary)
-        msg_lines.append(f"[{short_id}] {post['source']}\n{summary}\n{post['url']}\n")
+        add_to_pending(post['id'], short_id, post['text'], post['url'], post['source'])
+
+        # תקציר קצר: 150 תווים ראשונים מהטקסט
+        preview = post['text'][:150].replace('\n', ' ').strip()
+        if len(post['text']) > 150:
+            preview += "..."
+
+        msg_lines.append(
+            f"[{short_id}] {post['source']}\n"
+            f"{preview}\n"
+            f"{post['url']}\n"
+        )
 
     full_msg = "\n".join(msg_lines)
+
+    # WhatsApp מגביל ל-4000 תווים — אם ארוך מדי, שלח בחלקים
     print(f"\n📱 שולח לוואטסאפ...")
-    send_whatsapp(full_msg[:4000])
+    if len(full_msg) <= 4000:
+        send_whatsapp(full_msg)
+    else:
+        # שלח בחלקים
+        chunk = msg_lines[0]  # כותרת
+        for line in msg_lines[1:]:
+            if len(chunk) + len(line) + 1 > 3800:
+                send_whatsapp(chunk)
+                chunk = f"🔍 המשך סריקה {now_str}:\n\n" + line
+            else:
+                chunk += "\n" + line
+        if chunk:
+            send_whatsapp(chunk)
 
 
 if __name__ == "__main__":
