@@ -1,0 +1,134 @@
+name: Mortgage Monitor
+
+on:
+  schedule:
+    # UTC+2.5 = ישראל ±30 דקות
+    # 09:00 ישראל → 06:30 UTC
+    - cron: '30 6 * * *'
+    # 13:00 ישראל → 10:30 UTC
+    - cron: '30 10 * * *'
+    # 18:00 ישראל → 15:30 UTC
+    - cron: '30 15 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'פעולה לביצוע'
+        required: true
+        default: 'scan'
+        type: choice
+        options:
+          - scan
+          - publish
+          - publish_and_scan
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests openai pytz
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Determine action (schedule vs manual)
+        id: determine_action
+        run: |
+          python3 - <<'EOF'
+          import os
+          import pytz
+          from datetime import datetime
+
+          israel_tz = pytz.timezone('Asia/Jerusalem')
+          now_israel = datetime.now(israel_tz)
+          hour = now_israel.hour
+          weekday = now_israel.weekday()  # 0=Mon, 6=Sun
+          
+          print(f"שעה בישראל: {now_israel.strftime('%Y-%m-%d %H:%M %Z')}")
+          print(f"יום בשבוע: {weekday} (0=ב, 6=א)")
+          
+          # בדיקת manual trigger
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          manual_action = os.environ.get('INPUT_ACTION', '')
+          
+          if event == 'workflow_dispatch' and manual_action:
+              action = manual_action
+              print(f"הפעלה ידנית: {action}")
+          else:
+              # ימי פרסום: ראשון(6), שלישי(1), חמישי(3)
+              is_publish_day = weekday in [6, 1, 3]
+              is_morning = hour < 11  # לפני 11:00 = סשן בוקר
+              
+              if is_publish_day and is_morning:
+                  action = 'publish_and_scan'
+              else:
+                  action = 'scan'
+              
+              print(f"פעולה אוטומטית: {action}")
+          
+          # כתיבה ל-GITHUB_OUTPUT
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"action={action}\n")
+          EOF
+
+      - name: Download state files from previous run
+        uses: actions/cache@v4
+        with:
+          path: /tmp/mortgage_data
+          key: mortgage-state-${{ github.run_id }}
+          restore-keys: |
+            mortgage-state-
+
+      - name: Run Publish
+        if: steps.determine_action.outputs.action == 'publish' || steps.determine_action.outputs.action == 'publish_and_scan'
+        env:
+          GREEN_API_INSTANCE: ${{ secrets.GREEN_API_INSTANCE }}
+          GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
+          IG_COOKIES_JSON: ${{ secrets.IG_COOKIES_JSON }}
+          POSTS_DATA_JSON: ${{ secrets.POSTS_DATA_JSON }}
+          PUBLISH_STATE_JSON: ${{ secrets.PUBLISH_STATE_JSON }}
+          DATA_DIR: /tmp/mortgage_data
+        run: |
+          python3 github_actions/publish_standalone.py
+
+      - name: Update PUBLISH_STATE secret after publish
+        if: steps.determine_action.outputs.action == 'publish' || steps.determine_action.outputs.action == 'publish_and_scan'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f /tmp/mortgage_data/publish_state.json ]; then
+            NEW_STATE=$(cat /tmp/mortgage_data/publish_state.json)
+            gh secret set PUBLISH_STATE_JSON --body "$NEW_STATE" --repo ${{ github.repository }}
+            echo "✅ PUBLISH_STATE_JSON עודכן"
+          fi
+
+      - name: Run Scan
+        if: steps.determine_action.outputs.action == 'scan' || steps.determine_action.outputs.action == 'publish_and_scan'
+        env:
+          GREEN_API_INSTANCE: ${{ secrets.GREEN_API_INSTANCE }}
+          GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
+          IG_COOKIES_JSON: ${{ secrets.IG_COOKIES_JSON }}
+          DATA_DIR: /tmp/mortgage_data
+        run: |
+          python3 github_actions/scan_standalone.py
+
+      - name: Save state files
+        uses: actions/cache@v4
+        with:
+          path: /tmp/mortgage_data
+          key: mortgage-state-${{ github.run_id }}
