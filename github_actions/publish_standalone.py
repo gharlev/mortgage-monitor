@@ -184,11 +184,38 @@ async def publish_to_instagram(page, post_text: str, post_index: int):
         return None
 
 
+def clean_cookies(cookies_list):
+    """ניקוי cookies לפורמט תקין של Playwright"""
+    valid_samesite = {'Strict', 'Lax', 'None'}
+    cleaned = []
+    for c in cookies_list:
+        cookie = {
+            'name': c.get('name', ''),
+            'value': c.get('value', ''),
+            'domain': c.get('domain', '.facebook.com'),
+            'path': c.get('path', '/'),
+        }
+        ss = c.get('sameSite') or c.get('samesite')
+        if isinstance(ss, str):
+            ss_map = {'lax': 'Lax', 'strict': 'Strict', 'none': 'None', 'no_restriction': 'None'}
+            ss = ss_map.get(ss.lower(), ss)
+            cookie['sameSite'] = ss if ss in valid_samesite else 'None'
+        else:
+            cookie['sameSite'] = 'None'
+        if c.get('secure') is not None:
+            cookie['secure'] = bool(c['secure'])
+        if c.get('httpOnly') is not None:
+            cookie['httpOnly'] = bool(c['httpOnly'])
+        if c.get('expirationDate'):
+            cookie['expires'] = int(c['expirationDate'])
+        cleaned.append(cookie)
+    return cleaned
+
 async def main():
     # טעינת נתונים
     try:
-        fb_cookies = json.loads(FB_COOKIES_JSON)
-        ig_cookies = json.loads(IG_COOKIES_JSON)
+        fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
+        ig_cookies = clean_cookies(json.loads(IG_COOKIES_JSON))
         posts = json.loads(POSTS_DATA_JSON)
         state = json.loads(PUBLISH_STATE_JSON)
     except Exception as e:
