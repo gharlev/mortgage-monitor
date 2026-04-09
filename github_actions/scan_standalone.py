@@ -296,9 +296,42 @@ async def run_scan():
     print("=" * 50)
 
     # טעינת cookies מ-environment variables
+    def clean_cookies(cookies_list):
+        """ניקוי cookies לפורמט תקין של Playwright"""
+        valid_samesite = {'Strict', 'Lax', 'None'}
+        cleaned = []
+        for c in cookies_list:
+            cookie = {
+                'name': c.get('name', ''),
+                'value': c.get('value', ''),
+                'domain': c.get('domain', '.facebook.com'),
+                'path': c.get('path', '/'),
+            }
+            # תיקון sameSite
+            ss = c.get('sameSite') or c.get('samesite')
+            if isinstance(ss, str):
+                # המרה מפורמט Cookie-Editor לפורמט Playwright
+                ss_map = {'lax': 'Lax', 'strict': 'Strict', 'none': 'None', 'no_restriction': 'None'}
+                ss = ss_map.get(ss.lower(), ss)
+                if ss in valid_samesite:
+                    cookie['sameSite'] = ss
+                else:
+                    cookie['sameSite'] = 'None'
+            else:
+                cookie['sameSite'] = 'None'
+            # שדות אופציונליים
+            if c.get('secure') is not None:
+                cookie['secure'] = bool(c['secure'])
+            if c.get('httpOnly') is not None:
+                cookie['httpOnly'] = bool(c['httpOnly'])
+            if c.get('expirationDate'):
+                cookie['expires'] = int(c['expirationDate'])
+            cleaned.append(cookie)
+        return cleaned
+
     try:
-        fb_cookies = json.loads(FB_COOKIES_JSON)
-        ig_cookies = json.loads(IG_COOKIES_JSON)
+        fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
+        ig_cookies = clean_cookies(json.loads(IG_COOKIES_JSON))
         print(f"✅ נטענו {len(fb_cookies)} FB cookies, {len(ig_cookies)} IG cookies")
     except Exception as e:
         print(f"❌ שגיאה בטעינת cookies: {e}")
