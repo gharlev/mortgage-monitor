@@ -51,7 +51,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright requests pytz
+          pip install playwright requests pytz PyNaCl
           playwright install chromium
           playwright install-deps chromium
 
@@ -134,8 +134,10 @@ jobs:
           GREEN_API_INSTANCE: ${{ secrets.GREEN_API_INSTANCE }}
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
           FB_COOKIES_JSON: ${{ secrets.FB_COOKIES_JSON }}
           IG_COOKIES_JSON: ${{ secrets.IG_COOKIES_JSON }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           DATA_DIR: /tmp/mortgage_data
         run: |
           python3 github_actions/scan_standalone.py

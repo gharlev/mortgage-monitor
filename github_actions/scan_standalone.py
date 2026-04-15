@@ -2,12 +2,13 @@
 """
 scan_standalone.py — סריקת פוסטים על משכנתא
 גרסה עצמאית לריצה ב-GitHub Actions (ללא CDP, עם headless Chromium)
-cookies נטענות מ-environment variables
+אימות פייסבוק דרך Playwright storageState (FB_STORAGE_STATE)
 
 שינויים:
 - הוסרה תלות ב-OpenAI (ללא סיכום AI)
 - מניעת כפילויות: seen_posts.json נשמר בין ריצות דרך GitHub Actions cache
 - התראה על cookies פגים: שליחת הודעת WhatsApp אם הדפדפן מנותב ל-login
+- שימוש ב-Playwright storageState במקום הזרקת cookies ידנית
 """
 
 import asyncio
@@ -24,8 +25,11 @@ from playwright.async_api import async_playwright
 GREEN_API_INSTANCE = os.environ.get("GREEN_API_INSTANCE", "7103518794")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
 WHATSAPP_PHONE = os.environ.get("WHATSAPP_PHONE", "972543339066")
-FB_COOKIES_JSON = os.environ.get("FB_COOKIES_JSON", "[]")
+FB_STORAGE_STATE = os.environ.get("FB_STORAGE_STATE", "")  # Playwright storageState JSON
+FB_COOKIES_JSON = os.environ.get("FB_COOKIES_JSON", "[]")  # fallback: Cookie-Editor format
 IG_COOKIES_JSON = os.environ.get("IG_COOKIES_JSON", "[]")
+GH_PAT = os.environ.get("GH_PAT", "")
+GH_REPO = os.environ.get("GITHUB_REPOSITORY", "gharlev/mortgage-monitor")
 
 # קבצי state — ב-GitHub Actions נשמרים ב-/tmp (מועברים בין ריצות דרך cache)
 BASE_DIR = Path(os.environ.get("DATA_DIR", "/tmp/mortgage_data"))
@@ -184,6 +188,123 @@ def send_whatsapp(message):
         return False
 
 
+def update_github_secret(secret_name, secret_value):
+    """מעדכן GitHub Secret דרך ה-API — לשמירת storageState מעודכן"""
+    if not GH_PAT:
+        print(f"  ⚠️ GH_PAT לא מוגדר — לא ניתן לעדכן {secret_name}")
+        return False
+    try:
+        import base64
+        from nacl import encoding, public as nacl_public
+
+        headers = {
+            "Authorization": f"token {GH_PAT}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        # קבלת מפתח ציבורי של ה-repo
+        key_url = f"https://api.github.com/repos/{GH_REPO}/actions/secrets/public-key"
+        r = requests.get(key_url, headers=headers, timeout=10)
+        r.raise_for_status()
+        key_data = r.json()
+
+        # הצפנה
+        pub_key = nacl_public.PublicKey(key_data["key"].encode("utf-8"), encoding.Base64Encoder())
+        sealed_box = nacl_public.SealedBox(pub_key)
+        encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+        encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
+
+        # עדכון ה-secret
+        secret_url = f"https://api.github.com/repos/{GH_REPO}/actions/secrets/{secret_name}"
+        payload = {"encrypted_value": encrypted_b64, "key_id": key_data["key_id"]}
+        r = requests.put(secret_url, headers=headers, json=payload, timeout=10)
+        if r.status_code in (201, 204):
+            print(f"  ✅ {secret_name} עודכן בהצלחה")
+            return True
+        else:
+            print(f"  ❌ שגיאה בעדכון {secret_name}: {r.status_code}")
+            return False
+    except Exception as e:
+        print(f"  ❌ שגיאה בעדכון GitHub Secret: {e}")
+        return False
+
+
+def build_fb_storage_state():
+    """בונה Playwright storageState מ-FB_STORAGE_STATE או מ-FB_COOKIES_JSON כ-fallback"""
+    # נסה קודם FB_STORAGE_STATE (פורמט Playwright מלא)
+    if FB_STORAGE_STATE:
+        try:
+            state = json.loads(FB_STORAGE_STATE)
+            if "cookies" in state:
+                print(f"✅ נטען FB_STORAGE_STATE עם {len(state['cookies'])} cookies")
+                return state
+        except Exception as e:
+            print(f"⚠️ שגיאה בפענוח FB_STORAGE_STATE: {e}")
+
+    # fallback: FB_COOKIES_JSON (פורמט Cookie-Editor)
+    if FB_COOKIES_JSON and FB_COOKIES_JSON != "[]":
+        try:
+            ce_cookies = json.loads(FB_COOKIES_JSON)
+            valid_samesite = {'Strict', 'Lax', 'None'}
+            ss_map = {'lax': 'Lax', 'strict': 'Strict', 'none': 'None', 'no_restriction': 'None'}
+            playwright_cookies = []
+            for c in ce_cookies:
+                expires = c.get("expirationDate", -1) or -1
+                ss = c.get("sameSite") or c.get("samesite")
+                if isinstance(ss, str):
+                    ss = ss_map.get(ss.lower(), ss)
+                    if ss not in valid_samesite:
+                        ss = 'None'
+                else:
+                    ss = 'None'
+                playwright_cookies.append({
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c.get("domain", ".facebook.com"),
+                    "path": c.get("path", "/"),
+                    "expires": int(expires) if expires != -1 else -1,
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "secure": bool(c.get("secure", True)),
+                    "sameSite": ss
+                })
+            print(f"✅ נטענו {len(playwright_cookies)} FB cookies מ-FB_COOKIES_JSON (fallback)")
+            return {"cookies": playwright_cookies, "origins": []}
+        except Exception as e:
+            print(f"⚠️ שגיאה בפענוח FB_COOKIES_JSON: {e}")
+
+    print("⚠️ אין FB cookies זמינים")
+    return None
+
+
+def clean_ig_cookies(cookies_list):
+    """ניקוי IG cookies לפורמט תקין של Playwright"""
+    valid_samesite = {'Strict', 'Lax', 'None'}
+    ss_map = {'lax': 'Lax', 'strict': 'Strict', 'none': 'None', 'no_restriction': 'None'}
+    cleaned = []
+    for c in cookies_list:
+        ss = c.get('sameSite') or c.get('samesite')
+        if isinstance(ss, str):
+            ss = ss_map.get(ss.lower(), ss)
+            if ss not in valid_samesite:
+                ss = 'None'
+        else:
+            ss = 'None'
+        cookie = {
+            'name': c.get('name', ''),
+            'value': c.get('value', ''),
+            'domain': c.get('domain', '.instagram.com'),
+            'path': c.get('path', '/'),
+            'sameSite': ss,
+        }
+        if c.get('secure') is not None:
+            cookie['secure'] = bool(c['secure'])
+        if c.get('httpOnly') is not None:
+            cookie['httpOnly'] = bool(c['httpOnly'])
+        if c.get('expirationDate'):
+            cookie['expires'] = int(c['expirationDate'])
+        cleaned.append(cookie)
+    return cleaned
+
+
 async def scrape_facebook_group(page, group_url, seen_posts):
     new_posts = []
     group_name = group_url.split('/')[-1]
@@ -295,47 +416,15 @@ async def run_scan():
     print(f"🔍 מתחיל סריקה - {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     print("=" * 50)
 
-    # טעינת cookies מ-environment variables
-    def clean_cookies(cookies_list):
-        """ניקוי cookies לפורמט תקין של Playwright"""
-        valid_samesite = {'Strict', 'Lax', 'None'}
-        cleaned = []
-        for c in cookies_list:
-            cookie = {
-                'name': c.get('name', ''),
-                'value': c.get('value', ''),
-                'domain': c.get('domain', '.facebook.com'),
-                'path': c.get('path', '/'),
-            }
-            # תיקון sameSite
-            ss = c.get('sameSite') or c.get('samesite')
-            if isinstance(ss, str):
-                # המרה מפורמט Cookie-Editor לפורמט Playwright
-                ss_map = {'lax': 'Lax', 'strict': 'Strict', 'none': 'None', 'no_restriction': 'None'}
-                ss = ss_map.get(ss.lower(), ss)
-                if ss in valid_samesite:
-                    cookie['sameSite'] = ss
-                else:
-                    cookie['sameSite'] = 'None'
-            else:
-                cookie['sameSite'] = 'None'
-            # שדות אופציונליים
-            if c.get('secure') is not None:
-                cookie['secure'] = bool(c['secure'])
-            if c.get('httpOnly') is not None:
-                cookie['httpOnly'] = bool(c['httpOnly'])
-            if c.get('expirationDate'):
-                cookie['expires'] = int(c['expirationDate'])
-            cleaned.append(cookie)
-        return cleaned
+    # בניית FB storageState
+    fb_storage_state = build_fb_storage_state()
 
+    # טעינת IG cookies
     try:
-        fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
-        ig_cookies = clean_cookies(json.loads(IG_COOKIES_JSON))
-        print(f"✅ נטענו {len(fb_cookies)} FB cookies, {len(ig_cookies)} IG cookies")
+        ig_cookies = clean_ig_cookies(json.loads(IG_COOKIES_JSON))
+        print(f"✅ נטענו {len(ig_cookies)} IG cookies")
     except Exception as e:
-        print(f"❌ שגיאה בטעינת cookies: {e}")
-        fb_cookies = []
+        print(f"❌ שגיאה בטעינת IG cookies: {e}")
         ig_cookies = []
 
     # טעינת היסטוריית פוסטים (מניעת כפילויות)
@@ -357,13 +446,15 @@ async def run_scan():
             ]
         )
 
-        # יצירת context עם cookies של פייסבוק
-        fb_context = await browser.new_context(
-            viewport={'width': 1280, 'height': 900},
-            locale='he-IL',
-        )
-        if fb_cookies:
-            await fb_context.add_cookies(fb_cookies)
+        # יצירת context עם FB storageState (Playwright native)
+        fb_context_kwargs = {
+            'viewport': {'width': 1280, 'height': 900},
+            'locale': 'he-IL',
+        }
+        if fb_storage_state:
+            fb_context_kwargs['storage_state'] = fb_storage_state
+
+        fb_context = await browser.new_context(**fb_context_kwargs)
         fb_page = await fb_context.new_page()
 
         # סריקת קבוצות פייסבוק
@@ -376,6 +467,16 @@ async def run_scan():
             all_new_posts.extend(posts)
             for p_item in posts:
                 seen_posts.add(p_item['id'])
+
+        # שמירת storageState מעודכן אחרי הסריקה (לחידוש cookies)
+        if not fb_cookies_expired and GH_PAT:
+            try:
+                updated_state = await fb_context.storage_state()
+                updated_state_json = json.dumps(updated_state, ensure_ascii=False)
+                print("\n💾 שומר FB storageState מעודכן...")
+                update_github_secret("FB_STORAGE_STATE", updated_state_json)
+            except Exception as e:
+                print(f"  ⚠️ לא ניתן לשמור storageState: {e}")
 
         await fb_context.close()
 
