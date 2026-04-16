@@ -212,21 +212,52 @@ def clean_cookies(cookies_list):
         cleaned.append(cookie)
     return cleaned
 
+def build_fb_storage_state():
+    """בונה Playwright storageState מ-FB_STORAGE_STATE או מ-FB_COOKIES_JSON כ-fallback"""
+    if FB_STORAGE_STATE:
+        try:
+            state = json.loads(FB_STORAGE_STATE)
+            if "cookies" in state:
+                print(f"✅ נטען FB_STORAGE_STATE עם {len(state['cookies'])} cookies")
+                return state
+        except Exception as e:
+            print(f"⚠️ שגיאה בפענוח FB_STORAGE_STATE: {e}")
+    # fallback: FB_COOKIES_JSON
+    if FB_COOKIES_JSON and FB_COOKIES_JSON != "[]":
+        try:
+            ce_cookies = json.loads(FB_COOKIES_JSON)
+            valid_samesite = {'Strict', 'Lax', 'None'}
+            ss_map = {'lax': 'Lax', 'strict': 'Strict', 'none': 'None', 'no_restriction': 'None'}
+            playwright_cookies = []
+            for c in ce_cookies:
+                expires = c.get("expirationDate", -1) or -1
+                ss = c.get("sameSite") or c.get("samesite")
+                if isinstance(ss, str):
+                    ss = ss_map.get(ss.lower(), ss)
+                    if ss not in valid_samesite:
+                        ss = 'None'
+                else:
+                    ss = 'None'
+                playwright_cookies.append({
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c.get("domain", ".facebook.com"),
+                    "path": c.get("path", "/"),
+                    "expires": int(expires) if expires != -1 else -1,
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "secure": bool(c.get("secure", True)),
+                    "sameSite": ss
+                })
+            print(f"✅ נטענו {len(playwright_cookies)} FB cookies מ-FB_COOKIES_JSON (fallback)")
+            return {"cookies": playwright_cookies, "origins": []}
+        except Exception as e:
+            print(f"⚠️ שגיאה בפענוח FB_COOKIES_JSON: {e}")
+    return None
+
 async def main():
     # טעינת נתונים
     try:
-        # טעינת FB cookies — עדיפות ל-FB_STORAGE_STATE (Playwright storageState)
-        if FB_STORAGE_STATE:
-            try:
-                storage_state = json.loads(FB_STORAGE_STATE)
-                fb_cookies = clean_cookies(storage_state.get('cookies', []))
-                print(f"✅ נטען FB_STORAGE_STATE עם {len(fb_cookies)} cookies")
-            except Exception as e:
-                print(f"⚠️ שגיאה בטעינת FB_STORAGE_STATE: {e}, משתמש ב-FB_COOKIES_JSON")
-                fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
-        else:
-            fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
-            print(f"✅ נטענו {len(fb_cookies)} FB cookies (מ-FB_COOKIES_JSON)")
+        fb_storage_state = build_fb_storage_state()
         ig_cookies = clean_cookies(json.loads(IG_COOKIES_JSON))
         posts = json.loads(POSTS_DATA_JSON)
         state = json.loads(PUBLISH_STATE_JSON)
@@ -259,10 +290,11 @@ async def main():
             ]
         )
 
-        # Context לפייסבוק
-        fb_context = await browser.new_context(viewport={'width': 1280, 'height': 900}, locale='he-IL')
-        if fb_cookies:
-            await fb_context.add_cookies(fb_cookies)
+        # Context לפייסבוק — שימוש ב-storage_state (Playwright native)
+        fb_context_kwargs = {'viewport': {'width': 1280, 'height': 900}, 'locale': 'he-IL'}
+        if fb_storage_state:
+            fb_context_kwargs['storage_state'] = fb_storage_state
+        fb_context = await browser.new_context(**fb_context_kwargs)
         fb_page = await fb_context.new_page()
 
         print(f"\n📘 מפרסם ל-{len(FACEBOOK_GROUPS)} קבוצות פייסבוק...")
@@ -274,10 +306,11 @@ async def main():
 
         await fb_context.close()
 
-        # Context לאינסטגרם (משתמש ב-FB cookies כי Meta Business Suite)
-        ig_context = await browser.new_context(viewport={'width': 1280, 'height': 900}, locale='he-IL')
-        if fb_cookies:
-            await ig_context.add_cookies(fb_cookies)
+        # Context לאינסטגרם (Meta Business Suite — משתמש ב-FB storageState)
+        ig_context_kwargs = {'viewport': {'width': 1280, 'height': 900}, 'locale': 'he-IL'}
+        if fb_storage_state:
+            ig_context_kwargs['storage_state'] = fb_storage_state
+        ig_context = await browser.new_context(**ig_context_kwargs)
         ig_page = await ig_context.new_page()
 
         print('\n📸 מפרסם לאינסטגרם...')
