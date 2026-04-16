@@ -57,6 +57,8 @@ jobs:
 
       - name: Determine action (schedule vs manual)
         id: determine_action
+        env:
+          INPUT_ACTION: ${{ github.event.inputs.action }}
         run: |
           python3 - <<'EOF'
           import os
