@@ -17,6 +17,7 @@ from playwright.async_api import async_playwright
 GREEN_API_INSTANCE = os.environ.get("GREEN_API_INSTANCE", "7103518794")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN", "")
 WHATSAPP_PHONE = os.environ.get("WHATSAPP_PHONE", "972543339066")
+FB_STORAGE_STATE = os.environ.get("FB_STORAGE_STATE", "")
 FB_COOKIES_JSON = os.environ.get("FB_COOKIES_JSON", "[]")
 IG_COOKIES_JSON = os.environ.get("IG_COOKIES_JSON", "[]")
 
@@ -214,7 +215,18 @@ def clean_cookies(cookies_list):
 async def main():
     # טעינת נתונים
     try:
-        fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
+        # טעינת FB cookies — עדיפות ל-FB_STORAGE_STATE (Playwright storageState)
+        if FB_STORAGE_STATE:
+            try:
+                storage_state = json.loads(FB_STORAGE_STATE)
+                fb_cookies = clean_cookies(storage_state.get('cookies', []))
+                print(f"✅ נטען FB_STORAGE_STATE עם {len(fb_cookies)} cookies")
+            except Exception as e:
+                print(f"⚠️ שגיאה בטעינת FB_STORAGE_STATE: {e}, משתמש ב-FB_COOKIES_JSON")
+                fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
+        else:
+            fb_cookies = clean_cookies(json.loads(FB_COOKIES_JSON))
+            print(f"✅ נטענו {len(fb_cookies)} FB cookies (מ-FB_COOKIES_JSON)")
         ig_cookies = clean_cookies(json.loads(IG_COOKIES_JSON))
         posts = json.loads(POSTS_DATA_JSON)
         state = json.loads(PUBLISH_STATE_JSON)
